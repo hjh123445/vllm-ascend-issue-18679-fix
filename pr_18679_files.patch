@@ -1,0 +1,237 @@
+diff --git a/vllm_ascend/quantization/configs/modelslim_config.py b/vllm_ascend/quantization/configs/modelslim_config.py
+index bb8c1eb..ea71711 100644
+--- a/vllm_ascend/quantization/configs/modelslim_config.py
++++ b/vllm_ascend/quantization/configs/modelslim_config.py
+@@ -26,6 +26,7 @@
+ import os
+ from collections.abc import Callable
+ from functools import wraps
++from types import MethodType
+ from typing import Any, Optional
+ 
+ import regex as re
+@@ -75,33 +76,86 @@
+ )
+ 
+ 
++# Instance attribute holding the upstream (unbound) MoE weight loader while
++# the ModelSlim name-mapping wrapper is installed. Only the plain function is
++# stored, never the bound method, so the layer holds no self-reference.
++_MODELSLIM_ORIG_WEIGHT_LOADER = "_modelslim_orig_weight_loader"
++
++
++def _map_modelslim_moe_weight_name(weight_name: str) -> str:
++    prefix, separator, param_name = weight_name.rpartition(".")
++    mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
++    return f"{prefix}{separator}{mapped_name}"
++
++
++def _bound_modelslim_moe_weight_loader(
++    layer: torch.nn.Module,
++    param: torch.nn.Parameter,
++    loaded_weight: torch.Tensor,
++    weight_name: str,
++    shard_id: str,
++    expert_id: int,
++    return_success: bool = False,
++) -> bool | None:
++    """Bound-method form of the ModelSlim MoE name-mapping loader."""
++    weight_loader = getattr(layer, _MODELSLIM_ORIG_WEIGHT_LOADER)
++    return weight_loader(
++        layer,
++        param=param,
++        loaded_weight=loaded_weight,
++        weight_name=_map_modelslim_moe_weight_name(weight_name),
++        shard_id=shard_id,
++        expert_id=expert_id,
++        return_success=return_success,
++    )
++
++
+ def _make_modelslim_moe_weight_loader(
+     weight_loader: Callable[..., bool | None],
+ ) -> Callable[..., bool | None]:
+-    """Map ModelSlim MoE scale-bias names to the upstream scale path."""
++    """Map ModelSlim MoE scale-bias names to the upstream scale path.
++
++    For a bound loader the wrapper is returned as a bound method of the same
++    layer. vLLM's layerwise reload machinery sanitizes parameter attributes
++    through their ``__self__`` (see
++    ``vllm.model_executor.model_loader.reload.sanitize.sanitize_layer_refs``);
++    a plain closure wrapper keeps the original bound loader alive through its
++    closure cells and the ``__wrapped__`` attribute, pinning a discarded layer
++    and its weights in ``LAYERWISE_INFO`` forever (issue #18679). The
++    bound-method form is sanitized and restored like any other loader.
++
++    For non-bound loaders (e.g. plain mocks in unit tests) the closure form is
++    kept, since there is no layer reference to retain.
++    """
++    if getattr(weight_loader, "__func__", None) is _bound_modelslim_moe_weight_loader:
++        # Already wrapped; keep the existing wrapper (and its stored original).
++        return weight_loader
++
++    layer = getattr(weight_loader, "__self__", None)
++    if layer is None:
++
++        @wraps(weight_loader)
++        def modelslim_moe_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            weight_name: str,
++            shard_id: str,
++            expert_id: int,
++            return_success: bool = False,
++        ) -> bool | None:
++            return weight_loader(
++                param=param,
++                loaded_weight=loaded_weight,
++                weight_name=_map_modelslim_moe_weight_name(weight_name),
++                shard_id=shard_id,
++                expert_id=expert_id,
++                return_success=return_success,
++            )
+ 
+-    @wraps(weight_loader)
+-    def modelslim_moe_weight_loader(
+-        param: torch.nn.Parameter,
+-        loaded_weight: torch.Tensor,
+-        weight_name: str,
+-        shard_id: str,
+-        expert_id: int,
+-        return_success: bool = False,
+-    ) -> bool | None:
+-        prefix, separator, param_name = weight_name.rpartition(".")
+-        mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
+-        mapped_weight_name = f"{prefix}{separator}{mapped_name}"
+-        return weight_loader(
+-            param=param,
+-            loaded_weight=loaded_weight,
+-            weight_name=mapped_weight_name,
+-            shard_id=shard_id,
+-            expert_id=expert_id,
+-            return_success=return_success,
+-        )
++        return modelslim_moe_weight_loader
+ 
+-    return modelslim_moe_weight_loader
++    setattr(layer, _MODELSLIM_ORIG_WEIGHT_LOADER, weight_loader.__func__)
++    return MethodType(_bound_modelslim_moe_weight_loader, layer)
+ 
+ 
+ # The config filename that ModelSlim generates after quantizing a model.
+diff --git a/tests/ut/quantization/configs/test_modelslim_moe_loader_leak.py b/tests/ut/quantization/configs/test_modelslim_moe_loader_leak.py
+new file mode 100644
+index 0000000..80a1ffb
+--- /dev/null
++++ b/tests/ut/quantization/configs/test_modelslim_moe_loader_leak.py
+@@ -0,0 +1,110 @@
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# Copyright 2023 The vLLM team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++"""Regression tests for issue #18679.
++
++The ModelSlim MoE weight-loader wrapper must not keep a discarded layer (and
++its weights) alive through the layerwise reload metadata recorded at model
++initialization.
++"""
++
++import gc
++import weakref
++
++import torch
++from vllm.model_executor.model_loader.reload import layerwise
++
++from tests.ut.base import TestBase
++from vllm_ascend.quantization.configs.modelslim_config import (
++    _bound_modelslim_moe_weight_loader,
++    _make_modelslim_moe_weight_loader,
++    _MODELSLIM_ORIG_WEIGHT_LOADER,
++)
++
++
++class _Expert(torch.nn.Module):
++    """Minimal layer mirroring routed_experts.RoutedExperts loader usage."""
++
++    def __init__(self, wrapped: bool):
++        super().__init__()
++        self.weight = torch.nn.Parameter(
++            torch.empty(1024, 1024, dtype=torch.int8, device="cpu"),
++            requires_grad=False,
++        )
++        if wrapped:
++            self.weight_loader = _make_modelslim_moe_weight_loader(self.weight_loader)
++        self.weight.weight_loader = self.weight_loader
++
++    def weight_loader(self, *args, **kwargs):
++        return None
++
++
++class TestModelSlimMoeWeightLoaderLeak(TestBase):
++    def _retention_after_reload_metadata(self, wrapped: bool) -> tuple[bool, bool]:
++        layer = _Expert(wrapped)
++        layer_ref = weakref.ref(layer)
++        weight_ref = weakref.ref(layer.weight)
++        layerwise.record_metadata_for_reloading(layer)
++
++        del layer
++        gc.collect()
++        return layer_ref() is not None, weight_ref() is not None
++
++    def test_unwrapped_layer_is_collected(self):
++        layer_retained, weight_retained = self._retention_after_reload_metadata(False)
++        self.assertFalse(layer_retained)
++        self.assertFalse(weight_retained)
++
++    def test_wrapped_layer_is_collected(self):
++        # Regression test for issue #18679: the ModelSlim wrapper used to pin
++        # the layer and its weights through LAYERWISE_INFO.
++        layer_retained, weight_retained = self._retention_after_reload_metadata(True)
++        self.assertFalse(layer_retained)
++        self.assertFalse(weight_retained)
++
++    def test_wrapper_delegates_with_mapped_name(self):
++        calls = []
++
++        class _Recording(_Expert):
++            def weight_loader(self, param, loaded_weight, weight_name, **kwargs):
++                calls.append(weight_name)
++                return True
++
++        layer = _Recording(True)
++        ret = layer.weight_loader(
++            param=layer.weight,
++            loaded_weight=torch.empty(1, dtype=torch.int8),
++            weight_name="model.layers.0.mlp.experts.w2_scale_bias",
++            shard_id="w2",
++            expert_id=0,
++            return_success=True,
++        )
++        self.assertTrue(ret)
++        self.assertEqual(calls, ["model.layers.0.mlp.experts.w2_scale"])
++
++    def test_wrapper_is_idempotent(self):
++        layer = _Expert(True)
++        first = layer.weight_loader
++        layer.weight_loader = _make_modelslim_moe_weight_loader(layer.weight_loader)
++        self.assertIs(layer.weight_loader, first)
++
++    def test_wrapper_restores_after_sanitize(self):
++        # After sanitize/restore (reload round-trip), the wrapper must still
++        # delegate to the upstream loader of the (possibly new) layer.
++        layer = _Expert(True)
++        wrapper = layer.weight_loader
++        self.assertIs(wrapper.__func__, _bound_modelslim_moe_weight_loader)
++        # the upstream loader is reachable through the layer attribute
++        self.assertTrue(callable(getattr(layer, _MODELSLIM_ORIG_WEIGHT_LOADER)))
