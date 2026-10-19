@@ -1,0 +1,41 @@
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index e95488e068..0228c5f743fd7a3c14cec10bf37d682da118683f 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -1518,19 +1518,33 @@
+         target_dtype: torch.dtype,
+         layer,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Gather paged INT8 KV blocks and dequantize."""
++        """Gather paged INT8 KV blocks and dequantize.
++
++        The block table is gathered only up to the live block count of the
++        longest sequence instead of the full padded table width. ``seq_lens``
++        is a host-side list at both call sites, so the trimmed width is
++        computed without any device-to-host synchronization. Padded columns
++        beyond the live block count only contribute rows that the validity
++        mask discards, so trimming them preserves the output bit-for-bit
++        while skipping the gather/layout/compaction of dead blocks (#19003).
++        """
+         batch_size = block_table.shape[0]
+         max_blocks_per_seq = block_table.shape[1]
+ 
+         # NZ 5D view: (num_blocks, num_kv_heads, head_size//nz, block_size, nz)
+         block_size = self.key_cache.shape[1]  # type: ignore[attr-defined]
+-        max_tokens_padded = max_blocks_per_seq * block_size
++
++        needed_blocks = (max(seq_lens) + block_size - 1) // block_size if seq_lens else 0
++        if 0 < needed_blocks < max_blocks_per_seq:
++            block_table = block_table[:, :needed_blocks]
++
++        max_tokens_padded = block_table.shape[1] * block_size
+ 
+         flat_ids = block_table.reshape(-1)
+         key_nz = self._nz_5d_view(key, block_size)
+         value_nz = self._nz_5d_view(value, block_size)
+ 
+-        # Gather: (batch*max_blocks, H, D//nz, S, nz)
++        # Gather: (batch*needed_blocks, H, D//nz, S, nz)
+         gathered_k = key_nz[flat_ids]
+         gathered_v = value_nz[flat_ids]
+         # NZ→ND conversion: permute (S, H, D//nz, nz) → reshape (S, H, D)
